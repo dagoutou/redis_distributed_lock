@@ -2,7 +2,9 @@ package redis_client
 
 import (
 	"context"
+	"errors"
 	"github.com/gomodule/redigo/redis"
+	"strings"
 	"time"
 )
 
@@ -15,6 +17,10 @@ const (
 type Client struct {
 	pools *redis.Pool
 	ClientOptions
+}
+
+type LockClient interface {
+	SetNEx(ctx context.Context, key, value string, expireSeconds int64) (int64, error)
 }
 
 func NewRedisClient(network, address, password string, opts ...ClientOption) *Client {
@@ -87,4 +93,60 @@ func (c *Client) getRedisConn() (redis.Conn, error) {
 		return nil, err
 	}
 	return conn, nil
+}
+
+func (c *Client) Get(ctx context.Context, key string) (string, error) {
+	if key == "" {
+		return "", errors.New("redis GET key can't be empty")
+	}
+	conn, err := c.pools.GetContext(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer conn.Close()
+	return redis.String(conn.Do("GET", key))
+}
+
+func (c *Client) Set(ctx context.Context, key string) (int, error) {
+	if key == "" {
+		return 0, errors.New("redis SET key can't be empty")
+	}
+	conn, err := c.pools.GetContext(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer conn.Close()
+	return redis.Int(conn.Do("SET", key))
+}
+
+func (c *Client) SetNEx(ctx context.Context, key, value string, expiredSeconds int64) (int64, error) {
+	if key == "" || value == "" {
+		return -1, errors.New("redis SETNEX key or value can't be empty")
+	}
+	conn, err := c.pools.GetContext(ctx)
+	if err != nil {
+		return -1, err
+	}
+	defer conn.Close()
+	reply, err := conn.Do("SET", key, value, "EX", expiredSeconds, "NX")
+	if err != nil {
+		return -1, err
+	}
+	if replyStr, ok := reply.(string); ok && strings.ToLower(replyStr) == "ok" {
+		return 1, nil
+	}
+	return redis.Int64(reply, err)
+}
+
+func (c *Client) Eval(ctx context.Context, src string, keyCount int, keysAndArgs []interface{}) (interface{}, error) {
+	args := make([]interface{}, 2+len(keysAndArgs))
+	args[0] = src
+	args[1] = keyCount
+	copy(args[2:], keysAndArgs)
+	conn, err := c.pools.GetContext(ctx)
+	if err != nil {
+		return -1, err
+	}
+	defer conn.Close()
+	return conn.Do("EVAL", args...)
 }
