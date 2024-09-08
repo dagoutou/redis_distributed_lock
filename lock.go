@@ -1,16 +1,16 @@
-package redis_lock
+package redis_distributed_lock
 
 import (
 	"context"
 	"errors"
 	"fmt"
-	"redis_lock/redis_client"
-	"redis_lock/utils"
+	"sync/atomic"
 	"time"
 )
 
 const (
 	RedisLockKeyPrefix = "REDIS_LOCK_PREFIX_"
+	WatchDogTimeStep   = 10
 	LUADeleteLock      = `
 local lockKey = KEYS[1]
 local token = ARGV[1]
@@ -21,29 +21,50 @@ if (not getToken or getToken ~=token) then
    return redis.cal('del',token)
       end
 `
+	LUADelayExpiredTime = `
+local lockKey = KEYS[1]
+local token = ARGV[1]
+local time = ARGV[2]
+local getToken = redis.call('get',lockKey)
+if (not getToken or getToken ~= token) then 
+        return 0
+        else
+        return redis.cal('expire',lockKey,time)
+`
 )
 
 var ErrorRedisLockFail = errors.New("Failed to obtain lock")
 
 type RedisLock struct {
-	client        *redis_client.Client
-	token         string
-	key           string
-	expireSeconds int64
+	RedisLockOptions
+	client LockClient
+	token  string
+	key    string
 
-	isBlock             bool  // 是否是阻塞模式
-	blockWaitingSeconds int64 // 能阻塞等待的时间
+	runningWatchDog int32              // 看门狗标识位
+	stopWatchDog    context.CancelFunc // 停止看门狗
 }
 
-func NewRedisLock(key string, client *redis_client.Client) *RedisLock {
-	return &RedisLock{
+func NewRedisLock(key string, client LockClient, opts ...RedisLockOption) *RedisLock {
+	cl := RedisLock{
 		client: client,
-		token:  utils.GetProcessAdnGoroutineIDStr(),
+		token:  GetProcessAdnGoroutineIDStr(),
 		key:    key,
 	}
+	for _, opt := range opts {
+		opt(&cl.RedisLockOptions)
+	}
+	repairLock(&cl.RedisLockOptions)
+	return &cl
 }
 
 func (r *RedisLock) Lock(ctx context.Context) (err error) {
+	defer func() {
+		if err != nil {
+			return
+		}
+		r.watchDog(ctx)
+	}()
 	// 尝试获取锁
 	err = r.tryLock(ctx)
 	if err == nil {
@@ -60,6 +81,51 @@ func (r *RedisLock) Lock(ctx context.Context) (err error) {
 	// 基于阻塞模式轮询取锁
 	err = r.blockingLock(ctx)
 	return
+}
+
+func (r *RedisLock) watchDog(ctx context.Context) {
+	if !r.watchDogMode {
+		return
+	}
+	// 一次取锁只能开启一次看门狗
+	for !atomic.CompareAndSwapInt32(&r.runningWatchDog, 0, 1) {
+	}
+	ctx, r.stopWatchDog = context.WithCancel(ctx)
+
+	go func() {
+		defer func() {
+			atomic.CompareAndSwapInt32(&r.runningWatchDog, 1, 0)
+		}()
+		r.runWatchDog(ctx)
+	}()
+}
+
+func (r *RedisLock) runWatchDog(ctx context.Context) {
+	// 看门狗每10s续约一次
+	ticker := time.NewTicker(time.Duration(WatchDogTimeStep) * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		// 加10可以防止因为网络延时产生的锁提前释放
+		_ = r.delayExpiredTime(ctx, WatchDogTimeStep+10)
+	}
+}
+
+func (r *RedisLock) delayExpiredTime(ctx context.Context, expireSeconds int64) error {
+	args := []interface{}{LUADelayExpiredTime, r.getLockKey(), expireSeconds}
+	reply, err := r.client.Eval(ctx, LUADelayExpiredTime, 1, args)
+	if err != nil {
+		return err
+	}
+	if rep, _ := reply.(int64); rep != 1 {
+		return errors.New("set expired time error")
+	}
+	return nil
 }
 
 func IsRetryErr(err error) bool {

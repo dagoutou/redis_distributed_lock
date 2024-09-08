@@ -1,4 +1,4 @@
-package redis_client
+package redis_distributed_lock
 
 import (
 	"context"
@@ -21,6 +21,7 @@ type Client struct {
 
 type LockClient interface {
 	SetNEx(ctx context.Context, key, value string, expireSeconds int64) (int64, error)
+	Eval(ctx context.Context, src string, keyCount int, keysAndArgs []interface{}) (interface{}, error)
 }
 
 func NewRedisClient(network, address, password string, opts ...ClientOption) *Client {
@@ -35,7 +36,7 @@ func NewRedisClient(network, address, password string, opts ...ClientOption) *Cl
 		opt(&c.ClientOptions)
 	}
 
-	repairLock(&c.ClientOptions)
+	repairClient(&c.ClientOptions)
 
 	pools := c.getRedisPools()
 
@@ -44,7 +45,7 @@ func NewRedisClient(network, address, password string, opts ...ClientOption) *Cl
 	}
 }
 
-func repairLock(c *ClientOptions) {
+func repairClient(c *ClientOptions) {
 	if c.maxIdle < 0 {
 		c.maxIdle = DefaultMaxIdle
 	}
@@ -61,6 +62,7 @@ func (c *Client) getRedisPools() *redis.Pool {
 		Dial: func() (redis.Conn, error) {
 			conn, err := c.getRedisConn()
 			if err != nil {
+				panic(err)
 				return nil, err
 			}
 			return conn, nil
@@ -90,6 +92,10 @@ func (c *Client) getRedisConn() (redis.Conn, error) {
 
 	conn, err := redis.DialContext(context.Background(), c.network, c.address, redisOptions...)
 	if err != nil {
+		return nil, err
+	}
+	if _, err = conn.Do("SELECT", 0); err != nil {
+		conn.Close()
 		return nil, err
 	}
 	return conn, nil

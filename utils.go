@@ -1,4 +1,4 @@
-package utils
+package redis_distributed_lock
 
 import (
 	"fmt"
